@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+# Help: Displays the usage instructions and options for the script.
+function Help() {
+    cat <<EOF
+
+Usage: hyprclipshot [options ..] [-m [mode] ..] -- [command]
+
+Hyprshot is a utility to easily take screenshots in Hyprland using your mouse.
+HyprClipShot is a modified fork of Hyprshot.
+
+It allows taking screenshots of windows, regions, and monitors, which are copied to your clipboard and also offers an option to be saved to a folder via notification.
+By default, it will use freeze and utilize a default folder for saving with auto-generated filenames. This also displays the screenshot in a notification.
+
+However, for simplification, this doesn't include:
+
+  -o, --output-folder       directory in which to save screenshot
+  -f, --filename            the file name of the resulting screenshot
+  -z, --freeze              freeze the screen on initialization
+  -s, --silent              don't send notification when screenshot is saved
+  -r, --raw                 output raw image data to stdout
+  --clipboard-only          copy screenshot to clipboard and don't save image in disk
+
+to reduce confusion.
+
+Examples:
+  capture a window                    \`hyprshot -m window\`
+  capture active window to clipboard  \`hyprshot -m window -m active --clipboard-only\`
+  capture selected monitor            \`hyprshot -m output -m DP-1\`
+
+Options:
+  -h, --help                show help message
+  -m, --mode                one of: output, window, region, active, OUTPUT_NAME
+  -D, --delay               how long to delay taking the screenshot after selection (seconds)
+  -d, --debug               print debug information
+  -t, --notif-timeout       notification timeout in milliseconds (default 5000)
+  -- [command]              open screenshot with a command of your choosing. e.g. hyprshot -m window -- mirage
+
+Modes:
+  output          take screenshot of an entire monitor
+  window          take screenshot of an open window
+  region          take screenshot of selected region
+  active          take screenshot of active window|output
+                  (you must use --mode again with the intended selection)
+  OUTPUT_NAME     take screenshot of output with OUTPUT_NAME
+                  (you must use --mode again with the intended selection)
+                  (you can get this from \`hyprctl monitors\`)
+EOF
+}
+
+# Print: Debugging function to print messages to stderr if DEBUG is enabled.
+function Print() {
+    if [ "$DEBUG" -eq 0 ]; then
+        return 0
+    fi
+
+    # Redirect printf output to standard error (>&2)
+    printf "$@" >&2
+}
+
+# send_notification: Sends a desktop notification after a screenshot is taken.
+function send_notification() {
+    if [ "$SILENT" -eq 1 ]; then
+        return 0
+    fi
+
+    local message
+    if [ "$CLIPBOARD" -eq 1 ]; then
+        message="Image copied to the clipboard"
+    else
+        message="Image saved in <i>${1}</i> and copied to the clipboard."
+    fi
+
+    notify-send "Screenshot saved" \
+                "${message}" \
+                -t "$NOTIF_TIMEOUT" -i "${1}" -a Hyprshot
+}
+
+# trim: Adjusts screenshot geometry to fit within monitor boundaries.
+function trim() {
+    Print "Geometry: %s\n" "${1}"
+    local geometry="${1}"
+    local xy_str=$(echo "${geometry}" | cut -d' ' -f1)
+    local wh_str=$(echo "${geometry}" | cut -d' ' -f2)
+    local x=$(echo "${xy_str}" | cut -d',' -f1)
+    local y=$(echo "${xy_str}" | cut -d',' -f2)
+    local width=$(echo "${wh_str}" | cut -dx -f1)
+    local height=$(echo "${wh_str}" | cut -dx -f2)
+
+    # Get overall screen dimensions and minimum coordinates from hyprctl
+    local max_width=$(hyprctl monitors -j | jq -r '[.[] | if (.transform % 2 == 0) then (.x + .width) else (.x + .height) end] | max')
+    local max_height=$(hyprctl monitors -j | jq -r '[.[] | if (.transform % 2 == 0) then (.y + .height) else (.y + .width) end] | max')
+
+    local min_x=$(hyprctl monitors -j | jq -r '[.[] | (.x)] | min')
+    local min_y=$(hyprctl monitors -j | jq -r '[.[] | (.y)] | min')
+
+    local cropped_x=$x
+    local cropped_y=$y
+    local cropped_width=$width
+    local cropped_height=$height
+
+    # Adjust width if it extends beyond the maximum screen width
+    if (( x + width > max_width )); then
+        cropped_width=$((max_width - x))
+    fi
+    # Adjust height if it extends beyond the maximum screen height
+    if (( y + height > max_height )); then
+        cropped_height=$((max_height - y))
+    fi
+
+    # Adjust x if it starts before the minimum screen x, and expand width
+    if (( x < min_x )); then
+        cropped_x="$min_x"
+        cropped_width=$((cropped_width + x - min_x))
+    fi
+    # Adjust y if it starts before the minimum screen y, and expand height
+    if (( y < min_y )); then
+        cropped_y="$min_y"
+        cropped_height=$((cropped_height + y - min_y))
+    fi
+
+    # Format the cropped geometry string
+    local cropped
+    printf -v cropped "%s,%s %sx%s" \
+        "${cropped_x}" "${cropped_y}" \
+        "${cropped_width}" "${cropped_height}"
+    
+    Print "Crop: %s\n" "${cropped}"
+    echo "${cropped}"
+}
+
+# save_geometry: Takes the screenshot using grim and handles saving/clipboard.
+function save_geometry() {
+    local geometry="${1}"
+    local output=""
+
+    # If RAW mode is enabled, grim outputs to stdout directly
+    if [ "$RAW" -eq 1 ]; then
+        grim -g "${geometry}" -
+        return 0
+    fi
+
+    # If CLIPBOARD is 0, save to disk and copy to clipboard
+    if [ "$CLIPBOARD" -eq 0 ]; then
+        mkdir -p "$SAVEDIR"
+        grim -g "${geometry}" "$SAVE_FULLPATH"
+        output="$SAVE_FULLPATH"
+        wl-copy --type image/png < "$output"
+        # Execute a user-defined command if provided
+        [ -z "$COMMAND" ] || {
+            "$COMMAND" "$output"
+        }
+    else
+        # If CLIPBOARD is 1, copy to clipboard only
+        wl-copy --type image/png < <(grim -g "${geometry}" -)
+    fi
+
+    send_notification "$output"
+}
+
+# checkRunning: Background process to kill hyprpicker if slurp exits.
+function checkRunning() {
+    sleep 1 # Give slurp a moment to start
+    while true; do
+        # Check if slurp is still running
+        if [[ "$(pgrep slurp | wc -l)" -eq 0 ]]; then # Use wc -l for line count of PIDs
+            pkill hyprpicker 2>/dev/null # Kill hyprpicker silently if it's running
+            exit # Exit this background function
+        fi
+        sleep 0.5 # Check periodically
+    done
+}
+
+# begin_grab: Initiates the screenshot process based on the chosen option.
+function begin_grab() {
+    # If FREEZE is enabled and hyprpicker is available, run it to freeze the screen
+    if [ "$FREEZE" -eq 1 ] && command -v "hyprpicker" >/dev/null 2>&1; then
+        hyprpicker -r -z & # Run in background
+        sleep 0.2         # Give it a moment to take effect
+        HYPRPICKER_PID=$! # Store PID for later cleanup if needed (though checkRunning handles it)
+    fi
+
+    local option="$1"
+    local geometry=""
+
+    case "$option" in
+        output)
+            if [ "$CURRENT" -eq 1 ]; then
+                geometry=$(grab_active_output)
+            elif [ -z "$SELECTED_MONITOR" ]; then
+                geometry=$(grab_output)
+            else
+                geometry=$(grab_selected_output "$SELECTED_MONITOR")
+            fi
+            ;;
+        region)
+            geometry=$(grab_region)
+            ;;
+        window)
+            if [ "$CURRENT" -eq 1 ]; then
+                geometry=$(grab_active_window)
+            else
+                geometry=$(grab_window)
+            fi
+            geometry=$(trim "${geometry}") # Trim window geometry to screen bounds
+            ;;
+    esac
+
+    # Apply delay if specified
+    if [ "$DELAY" -gt 0 ] 2>/dev/null; then
+        sleep "$DELAY"
+    fi
+
+    save_geometry "${geometry}"
+}
+
+# grab_output: Allows user to select a monitor interactively using slurp.
+function grab_output() {
+    slurp -or
+}
+
+# grab_active_output: Gets the geometry of the currently active monitor.
+function grab_active_output() {
+    local active_workspace=$(hyprctl -j activeworkspace)
+    local monitors=$(hyprctl -j monitors)
+    Print "Monitors: %s\n" "$monitors"
+    Print "Active workspace: %s\n" "$active_workspace"
+
+    local active_workspace_id=$(echo "$active_workspace" | jq -r '.id')
+    local current_monitor="$(echo "$monitors" | jq -r 'first(.[] | select(.activeWorkspace.id == '$active_workspace_id'))')"
+    Print "Current output: %s\n" "$current_monitor"
+    echo "$current_monitor" | jq -r '"\(.x),\(.y) \(.width/.scale|round)x\(.height/.scale|round)"'
+}
+
+# grab_selected_output: Gets the geometry of a specifically named monitor.
+function grab_selected_output() {
+    local monitor_name="$1"
+    local monitor=$(hyprctl -j monitors | jq -r '.[] | select(.name == "'"$monitor_name"'")')
+    Print "Capturing: %s\n" "${monitor_name}"
+    echo "$monitor" | jq -r '"\(.x),\(.y) \(.width/.scale|round)x\(.height/.scale|round)"'
+}
+
+# grab_region: Allows user to select a rectangular region interactively using slurp.
+function grab_region() {
+    slurp -d
+}
+
+# grab_window: Allows user to select an open window interactively using slurp.
+function grab_window() {
+    local monitors=$(hyprctl -j monitors)
+    # Filter clients to only those visible on active workspaces
+    local active_workspace_ids=$(echo "$monitors" | jq -r 'map(.activeWorkspace.id) | join(",")')
+    local clients=$(hyprctl -j clients | jq -r '[.[] | select(.workspace.id | contains('$active_workspace_ids'))]')
+
+    Print "Monitors: %s\n" "$monitors"
+    Print "Clients: %s\n" "$clients"
+
+    # Generate boxes for each visible window and send that to slurp via stdin
+    local boxes="$(echo "$clients" | jq -r '.[] | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1]) \(.title)"' | cut -f1,2 -d' ')"
+    Print "Boxes:\n%s\n" "$boxes"
+    slurp -r <<< "$boxes"
+}
+
+# grab_active_window: Gets the geometry of the currently focused window.
+function grab_active_window() {
+    local active_window=$(hyprctl -j activewindow)
+    local box=$(echo "$active_window" | jq -r '"\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')
+    Print "Box:\n%s\n" "$box"
+    echo "$box"
+}
+
+# parse_mode: Parses the screenshot mode argument.
+function parse_mode() {
+    local mode="${1}"
+
+    case "$mode" in
+        window | region | output)
+            OPTION="$mode"
+            ;;
+        active)
+            CURRENT=1
+            ;;
+        *)
+            # Check if the mode is a valid monitor name
+            if hyprctl monitors -j | jq -re '.[] | select(.name == "'"$mode"'")' &>/dev/null; then
+                SELECTED_MONITOR="$mode"
+            else
+                Print "Error: Unknown mode or invalid monitor name: %s\n" "$mode" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+# args: Parses all command-line arguments using getopt.
+function args() {
+    # Define short and long options
+    local options=$(getopt -o hf:o:m:D:dszr:t: --long help,filename:,output-folder:,mode:,delay:,clipboard-only,debug,silent,freeze,raw,notif-timeout: -- "$@")
+    # Evaluate the parsed options, handling spaces and quotes correctly
+    eval set -- "$options"
+
+    while true; do
+        case "$1" in
+            -h | --help)
+                Help
+                exit 0
+                ;;
+            -o | --output-folder)
+                shift # Consume the option flag
+                SAVEDIR="$1"
+                ;;
+            -f | --filename)
+                shift
+                FILENAME="$1"
+                ;;
+            -D | --delay)
+                shift
+                DELAY="$1"
+                ;;
+            -m | --mode)
+                shift
+                parse_mode "$1"
+                ;;
+            --clipboard-only)
+                CLIPBOARD=1
+                ;;
+            -d | --debug)
+                DEBUG=1
+                ;;
+            -z | --freeze)
+                FREEZE=1
+                ;;
+            -s | --silent)
+                SILENT=1
+                ;;
+            -r | --raw)
+                RAW=1
+                ;;
+            -t | --notif-timeout)
+                shift
+                NOTIF_TIMEOUT="$1"
+                ;;
+            --) # End of options marker
+                shift # Skip the --
+                COMMAND="${@:1}" # Capture all remaining arguments as the command
+                break
+                ;;
+            *) # Unknown option
+                Print "Error: Invalid argument: %s\n" "$1" >&2
+                Help
+                exit 1
+                ;;
+        esac
+        shift # Move to the next argument
+    done
+
+    # Ensure a mode is specified unless help was requested
+    if [ -z "$OPTION" ]; then
+        Print "A mode is required\n\nAvailable modes are:\n\toutput\n\tregion\n\twindow\n" >&2
+        Help
+        exit 2
+    fi
+}
+
+# --- Main Script Execution ---
+
+# If no arguments provided, show help and exit
+if [ -z "$1" ]; then
+    Help
+    exit 0
+fi
+
+# Initialize global variables with default values
+CLIPBOARD=0
+DEBUG=0
+SILENT=0
+RAW=0
+NOTIF_TIMEOUT=5000
+CURRENT=0
+FREEZE=0
+OPTION="" # Initialize OPTION to avoid unbound variable errors
+
+# Determine default pictures directory
+if [ -z "$XDG_PICTURES_DIR" ]; then
+    if type xdg-user-dir &> /dev/null; then
+        XDG_PICTURES_DIR=$(xdg-user-dir PICTURES)
+    fi
+fi
+
+# Set default filename and savedir
+FILENAME="$(date +'%Y-%m-%d-%H%M%S_hyprshot.png')"
+if [ -z "$HYPRSHOT_DIR" ]; then
+    # Use XDG_PICTURES_DIR or fall back to home directory
+    SAVEDIR="${XDG_PICTURES_DIR:-$HOME}"
+else
+    SAVEDIR="${HYPRSHOT_DIR}"
+fi
+
+# Parse command-line arguments
+args "$0" "$@"
+
+# Construct the full save path
+SAVE_FULLPATH="$SAVEDIR/$FILENAME"
+[ "$CLIPBOARD" -eq 0 ] && Print "Saving in: %s\n" "$SAVE_FULLPATH"
+
+# Begin the screenshot process and run checkRunning in the background
+begin_grab "$OPTION" &
+checkRunning & # Run checkRunning in the background to monitor slurp
+wait %1 # Wait for begin_grab to finish (the first background job)
