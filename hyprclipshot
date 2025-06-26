@@ -12,42 +12,38 @@ Usage: hyprclipshot [options ..] [-m [mode] ..] -- [command]
 Hyprshot is a utility to easily take screenshots in Hyprland using your mouse.
 HyprClipShot is a modified fork of Hyprshot.
 
-It allows taking screenshots of windows, regions, and monitors, which are copied to your clipboard and also offers an option to be saved to a folder via notification.
-By default, it will use freeze and utilize a default folder for saving with auto-generated filenames. This also displays the screenshot in a notification.
+It allows taking screenshots of windows, regions, and monitors, which are copied
+to your clipboard and also offers an option to be saved to a folder via notification.
+By default, it will use freeze and utilize a default folder for saving with
+auto-generated filenames. This also displays the screenshot in a notification.
 
-However, for simplification, this doesn't include:
+This simplified version focuses on:
+1. Taking a screenshot and copying it to the clipboard.
+2. Displaying a notification with a "Save to Disk" action.
+3. If the user clicks "Save to Disk", the screenshot is saved to a default folder
+   with an auto-generated filename, and a second notification confirms the save.
 
-  -o, --output-folder       directory in which to save screenshot
-  -f, --filename            the file name of the resulting screenshot
-  -z, --freeze              freeze the screen on initialization
-  -s, --silent              don't send notification when screenshot is saved
-  -r, --raw                 output raw image data to stdout
-  --clipboard-only          copy screenshot to clipboard and don't save image in disk
-
-to reduce confusion.
-
-Examples:
-  capture a window                    \`hyprshot -m window\`
-  capture active window to clipboard  \`hyprshot -m window -m active --clipboard-only\`
-  capture selected monitor            \`hyprshot -m output -m DP-1\`
+Examples (commands to be run in your terminal):
+  capture a window:                           hyprshot -m window
+  capture active window:                      hyprshot -m window -m active
+  capture selected monitor:                   hyprshot -m output -m DP-1
 
 Options:
-  -h, --help                show help message
-  -m, --mode                one of: output, window, region, active, OUTPUT_NAME
-  -D, --delay               how long to delay taking the screenshot after selection (seconds)
-  -d, --debug               print debug information
-  -t, --notif-timeout       notification timeout in milliseconds (default 5000)
-  -- [command]              open screenshot with a command of your choosing. e.g. hyprshot -m window -- mirage
+  -h, --help            show help message
+  -m, --mode            one of: output, window, region, active, OUTPUT_NAME
+  -D, --delay           how long to delay taking the screenshot after selection (seconds)
+  -d, --debug           print debug information
+  -t, --notif-timeout   notification timeout in milliseconds (default 5000)
+  -- [command]          open screenshot with a command of your choosing. e.g. hyprshot -m window -- mirage
 
 Modes:
-  output          take screenshot of an entire monitor
-  window          take screenshot of an open window
-  region          take screenshot of selected region
-  active          take screenshot of active window|output
-                  (you must use --mode again with the intended selection)
-  OUTPUT_NAME     take screenshot of output with OUTPUT_NAME
-                  (you must use --mode again with the intended selection)
-                  (you can get this from \`hyprctl monitors\`)
+  output                take screenshot of an entire monitor
+  window                take screenshot of an open window
+  region                take screenshot of selected region
+  active                take screenshot of active window|output
+                        (you must use --mode again with the intended selection)
+  OUTPUT_NAME           take screenshot of output with OUTPUT_NAME
+                        (you can get this from hyprctl monitors)
 EOF
 }
 
@@ -62,24 +58,68 @@ function Print() {
 }
 
 # send_notification: Sends a desktop notification after a screenshot is taken.
+# Arguments:
+#   $1: (Optional) Path to the saved image. If provided, sends a "saved" notification.
+#       If empty, sends the initial "copied to clipboard" notification with a "Save to Disk" action.
+# Returns: The action ID (e.g., "save_to_disk") if an action was clicked, empty string otherwise.
 function send_notification() {
-    if [ "$SILENT" -eq 1 ]; then
-        return 0
-    fi
+    local message_or_path="${1}"
+    local action_output="" # To capture stdout of notify-send
 
-    local message
-    if [ "$CLIPBOARD" -eq 1 ]; then
-        message="Image copied to the clipboard"
+    if [ -n "${message_or_path}" ]; then
+        # Notification to confirm saving to disk
+        notify-send "HyprClipShot" \ "Image saved in <i>${message_or_path}</i>." \
+            -t "$NOTIF_TIMEOUT" \
+            -a HyprClipShot
+        # This type of notification does not return an action ID.
     else
-        message="Image saved in <i>${1}</i> and copied to the clipboard."
+        # Initial notification after copying to clipboard, with an action button.
+        # Capture stdout to get the action ID if clicked.
+        # Redirect stderr to /dev/null to suppress "Wait timeout expired" messages.
+        action_output=$(notify-send "HyprClipShot" \ "Image copied to the clipboard" \
+            -A "Save to Disk" \
+            -t "$NOTIF_TIMEOUT" \
+            -a HyprClipShot 2>/dev/null)
+        
+        echo "$action_output" # Output the captured action ID (or empty if timed out/dismissed)
     fi
+}
 
-    notify-send "Screenshot saved" \
-                "${message}" \
-                -t "$NOTIF_TIMEOUT" -i "${1}" -a Hyprshot
+# save_geometry: Takes the screenshot using grim and handles saving/clipboard.
+# Arguments:
+#   $1: The geometry string for the screenshot.
+function save_geometry() {
+    local geometry="${1}"
+    local output_path="" # Initialize to empty
+
+    # 1. Take screenshot and copy to clipboard
+    grim -g "${geometry}" - | wl-copy --type image/png
+
+    # 2. Send initial notification with "Save to Disk" action
+    # Call send_notification and capture its stdout for the action ID.
+    local clicked_action_id=$(send_notification "")
+
+    # 3. If "Save to Disk" action was clicked (identified by its action ID), then save to disk
+    if [ "$clicked_action_id" == "0" ]; then
+        mkdir -p "$SAVEDIR" || { Print "Error: Could not create directory %s\n" "$SAVEDIR" >&2; exit 1; }
+        grim -g "${geometry}" "$SAVE_FULLPATH" || { Print "Error: Could not save screenshot to %s\n" "$SAVE_FULLPATH" >&2; exit 1; }
+        output_path="$SAVE_FULLPATH"
+        
+        # Execute a user-defined command if provided (after saving)
+        [ -z "$COMMAND" ] || {
+            Print "Executing command: %s %s\n" "$COMMAND" "$output_path"
+            "$COMMAND" "$output_path" || Print "Warning: Command '%s' failed.\n" "$COMMAND" >&2
+        }
+        
+        send_notification "$output_path" # Send follow-up notification with the saved path
+    fi
+    # If clicked_action_id is empty (timeout/closed without action), do nothing further regarding saving to disk.
 }
 
 # trim: Adjusts screenshot geometry to fit within monitor boundaries.
+# Arguments:
+#   $1: The geometry string (e.g., "0,0 1920x1080").
+# Returns: The trimmed geometry string.
 function trim() {
     Print "Geometry: %s\n" "${1}"
     local geometry="${1}"
@@ -132,91 +172,6 @@ function trim() {
     echo "${cropped}"
 }
 
-# save_geometry: Takes the screenshot using grim and handles saving/clipboard.
-function save_geometry() {
-    local geometry="${1}"
-    local output=""
-
-    # If RAW mode is enabled, grim outputs to stdout directly
-    if [ "$RAW" -eq 1 ]; then
-        grim -g "${geometry}" -
-        return 0
-    fi
-
-    # If CLIPBOARD is 0, save to disk and copy to clipboard
-    if [ "$CLIPBOARD" -eq 0 ]; then
-        mkdir -p "$SAVEDIR"
-        grim -g "${geometry}" "$SAVE_FULLPATH"
-        output="$SAVE_FULLPATH"
-        wl-copy --type image/png < "$output"
-        # Execute a user-defined command if provided
-        [ -z "$COMMAND" ] || {
-            "$COMMAND" "$output"
-        }
-    else
-        # If CLIPBOARD is 1, copy to clipboard only
-        wl-copy --type image/png < <(grim -g "${geometry}" -)
-    fi
-
-    send_notification "$output"
-}
-
-# checkRunning: Background process to kill hyprpicker if slurp exits.
-function checkRunning() {
-    sleep 1 # Give slurp a moment to start
-    while true; do
-        # Check if slurp is still running
-        if [[ "$(pgrep slurp | wc -l)" -eq 0 ]]; then # Use wc -l for line count of PIDs
-            pkill hyprpicker 2>/dev/null # Kill hyprpicker silently if it's running
-            exit # Exit this background function
-        fi
-        sleep 0.5 # Check periodically
-    done
-}
-
-# begin_grab: Initiates the screenshot process based on the chosen option.
-function begin_grab() {
-    # If FREEZE is enabled and hyprpicker is available, run it to freeze the screen
-    if [ "$FREEZE" -eq 1 ] && command -v "hyprpicker" >/dev/null 2>&1; then
-        hyprpicker -r -z & # Run in background
-        sleep 0.2         # Give it a moment to take effect
-        HYPRPICKER_PID=$! # Store PID for later cleanup if needed (though checkRunning handles it)
-    fi
-
-    local option="$1"
-    local geometry=""
-
-    case "$option" in
-        output)
-            if [ "$CURRENT" -eq 1 ]; then
-                geometry=$(grab_active_output)
-            elif [ -z "$SELECTED_MONITOR" ]; then
-                geometry=$(grab_output)
-            else
-                geometry=$(grab_selected_output "$SELECTED_MONITOR")
-            fi
-            ;;
-        region)
-            geometry=$(grab_region)
-            ;;
-        window)
-            if [ "$CURRENT" -eq 1 ]; then
-                geometry=$(grab_active_window)
-            else
-                geometry=$(grab_window)
-            fi
-            geometry=$(trim "${geometry}") # Trim window geometry to screen bounds
-            ;;
-    esac
-
-    # Apply delay if specified
-    if [ "$DELAY" -gt 0 ] 2>/dev/null; then
-        sleep "$DELAY"
-    fi
-
-    save_geometry "${geometry}"
-}
-
 # grab_output: Allows user to select a monitor interactively using slurp.
 function grab_output() {
     slurp -or
@@ -236,6 +191,8 @@ function grab_active_output() {
 }
 
 # grab_selected_output: Gets the geometry of a specifically named monitor.
+# Arguments:
+#   $1: The name of the monitor.
 function grab_selected_output() {
     local monitor_name="$1"
     local monitor=$(hyprctl -j monitors | jq -r '.[] | select(.name == "'"$monitor_name"'")')
@@ -273,6 +230,8 @@ function grab_active_window() {
 }
 
 # parse_mode: Parses the screenshot mode argument.
+# Arguments:
+#   $1: The mode string.
 function parse_mode() {
     local mode="${1}"
 
@@ -295,10 +254,83 @@ function parse_mode() {
     esac
 }
 
+# checkRunning: Background process to kill hyprpicker if slurp exits.
+function checkRunning() {
+    sleep 1 # Give slurp a moment to start
+    while true; do
+        # Check if slurp is still running
+        if [[ "$(pgrep slurp | wc -l)" -eq 0 ]]; then # Use wc -l for line count of PIDs
+            pkill hyprpicker 2>/dev/null # Kill hyprpicker silently if it's running
+            exit # Exit this background function
+        fi
+        sleep 0.5 # Check periodically
+    done
+}
+
+# begin_grab: Initiates the screenshot process based on the chosen option.
+# Arguments:
+#   $1: The chosen screenshot option (e.g., "window", "region", "output").
+function begin_grab() {
+    # If hyprpicker is available, run it to freeze the screen
+    if command -v "hyprpicker" >/dev/null 2>&1; then
+        hyprpicker -r -z & # Run in background
+        sleep 0.2           # Give it a moment to take effect
+        HYPRPICKER_PID=$! # Store PID for later cleanup if needed (though checkRunning handles it)
+    fi
+
+    local option="$1"
+    local geometry=""
+
+    case "$option" in
+        output)
+            if [ "$CURRENT" -eq 1 ]; then
+                geometry=$(grab_active_output)
+            elif [ -z "$SELECTED_MONITOR" ]; then
+                geometry=$(grab_output)
+            else
+                geometry=$(grab_selected_output "$SELECTED_MONITOR")
+            fi
+            ;;
+        region)
+            geometry=$(grab_region)
+            ;;
+        window)
+            if [ "$CURRENT" -eq 1 ]; then
+                geometry=$(grab_active_window)
+            else
+                geometry=$(grab_window)
+            fi
+            geometry=$(trim "${geometry}") # Trim window geometry to screen bounds
+            ;;
+        *)
+            Print "Error: Invalid option passed to begin_grab: %s\n" "$option" >&2
+            exit 1
+            ;;
+    esac
+
+    # Check if geometry was successfully obtained
+    if [ -z "$geometry" ]; then
+        Print "Screenshot selection cancelled or failed.\n" >&2
+        # Ensure hyprpicker is killed if no geometry was selected (e.g., user pressed Esc in slurp)
+        if [ -n "$HYPRPICKER_PID" ] && ps -p "$HYPRPICKER_PID" > /dev/null; then
+            kill "$HYPRPICKER_PID" 2>/dev/null
+        fi
+        exit 1
+    fi
+
+    # Apply delay if specified
+    if [ "$DELAY" -gt 0 ] 2>/dev/null; then
+        sleep "$DELAY"
+    fi
+
+    save_geometry "${geometry}"
+}
+
 # args: Parses all command-line arguments using getopt.
 function args() {
     # Define short and long options
-    local options=$(getopt -o hf:o:m:D:dszr:t: --long help,filename:,output-folder:,mode:,delay:,clipboard-only,debug,silent,freeze,raw,notif-timeout: -- "$@")
+    # Removed: -f:, -o:, -s, -z, -r: (filename, output-folder, silent, freeze, raw)
+    local options=$(getopt -o hDm:d:t: --long help,delay:,mode:,debug,notif-timeout: -- "$@")
     # Evaluate the parsed options, handling spaces and quotes correctly
     eval set -- "$options"
 
@@ -308,14 +340,6 @@ function args() {
                 Help
                 exit 0
                 ;;
-            -o | --output-folder)
-                shift # Consume the option flag
-                SAVEDIR="$1"
-                ;;
-            -f | --filename)
-                shift
-                FILENAME="$1"
-                ;;
             -D | --delay)
                 shift
                 DELAY="$1"
@@ -324,20 +348,8 @@ function args() {
                 shift
                 parse_mode "$1"
                 ;;
-            --clipboard-only)
-                CLIPBOARD=1
-                ;;
             -d | --debug)
                 DEBUG=1
-                ;;
-            -z | --freeze)
-                FREEZE=1
-                ;;
-            -s | --silent)
-                SILENT=1
-                ;;
-            -r | --raw)
-                RAW=1
                 ;;
             -t | --notif-timeout)
                 shift
@@ -374,39 +386,36 @@ if [ -z "$1" ]; then
 fi
 
 # Initialize global variables with default values
-CLIPBOARD=0
 DEBUG=0
-SILENT=0
-RAW=0
 NOTIF_TIMEOUT=5000
-CURRENT=0
-FREEZE=0
-OPTION="" # Initialize OPTION to avoid unbound variable errors
+CURRENT=0 # Flag for active window/output selection
+OPTION="" # Stores the primary mode (window, region, output)
+DELAY=0   # Delay before taking screenshot
+COMMAND="" # Optional command to execute with the saved screenshot path
 
-# Determine default pictures directory
-if [ -z "$XDG_PICTURES_DIR" ]; then
-    if type xdg-user-dir &> /dev/null; then
-        XDG_PICTURES_DIR=$(xdg-user-dir PICTURES)
-    fi
-fi
-
-# Set default filename and savedir
-FILENAME="$(date +'%Y-%m-%d-%H%M%S_hyprshot.png')"
-if [ -z "$HYPRSHOT_DIR" ]; then
-    # Use XDG_PICTURES_DIR or fall back to home directory
-    SAVEDIR="${XDG_PICTURES_DIR:-$HOME}"
-else
-    SAVEDIR="${HYPRSHOT_DIR}"
-fi
+SAVEDIR="$HOME/Pictures/screenshots"
+# Generate filename based on current date and time
+SAVE_FULLPATH="${SAVEDIR}/$(date +'%Y-%m-%d-%H%M%S.png')"
 
 # Parse command-line arguments
-args "$0" "$@"
+args "$@" # Pass all original arguments to args function, not just "$0"
 
-# Construct the full save path
-SAVE_FULLPATH="$SAVEDIR/$FILENAME"
-[ "$CLIPBOARD" -eq 0 ] && Print "Saving in: %s\n" "$SAVE_FULLPATH"
-
-# Begin the screenshot process and run checkRunning in the background
+# Begin the Screenshot process and run checkRunning in the bg
 begin_grab "$OPTION" &
-checkRunning & # Run checkRunning in the background to monitor slurp
-wait %1 # Wait for begin_grab to finish (the first background job)
+# Store PID of begin_grab to wait for it later
+BEGIN_GRAB_PID=$!
+
+checkRunning &
+# Store PID of checkRunning to ensure it's handled (though it exits itself)
+CHECK_RUNNING_PID=$!
+
+# Wait for the begin_grab process to complete.
+# This ensures that all screenshot logic (including potential saving) finishes
+# before the script exits.
+wait "$BEGIN_GRAB_PID"
+
+# Ensure checkRunning is killed in case it's still running (e.g., if slurp didn't exit cleanly)
+if [ -n "$CHECK_RUNNING_PID" ] && ps -p "$CHECK_RUNNING_PID" > /dev/null; then
+    kill "$CHECK_RUNNING_PID" 2>/dev/null
+fi
+
