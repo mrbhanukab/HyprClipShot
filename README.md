@@ -1,33 +1,10 @@
 # Hyprshot
 
-[![AUR version](https://img.shields.io/aur/version/hyprshot?label=hyprshot&logo=arch+linux)](https://aur.archlinux.org/packages/hyprshot)
-[![AUR git version](https://img.shields.io/aur/version/hyprshot-git?label=hyprshot-git&logo=arch+linux)](https://aur.archlinux.org/packages/hyprshot-git)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/Gustash/hyprshot?color=green&logo=github)](https://github.com/Gustash/hyprshot/releases/latest)
-
 Hyprshot is an utility to easily take screenshot in Hyprland using your mouse.
 
 It allows taking screenshots of windows, regions and monitors which are saved to a folder of your choosing and copied to your clipboard.
 
 ## Installation
-
-### ALT Sisyphus
-
-```shell
-# apt-get install hyprshot
-```
-
-### Arch Linux
-
-You can install the [hyprshot](https://aur.archlinux.org/packages/hyprshot) package in AUR.
-
-### Gentoo Linux
-
-Activate wayland overlay as described in [README](https://github.com/bsd-ac/wayland-desktop#activate-overlay-via-eselect-repository), allow **~amd64** keyword and then install it:
-
-```bash
-# emerge --ask gui-apps/hyprshot
-```
-
 ### Dependencies
 
 - hyprland (this one should be obvious)
@@ -37,18 +14,25 @@ Activate wayland overlay as described in [README](https://github.com/bsd-ac/wayl
 - wl-clipboard (to copy screenshot to clipboard)
 - libnotify (to get notified when a screenshot is saved)
 
-### Optional Dependencies
+#### Optional Dependencies
 
 - hyprpicker (to freeze the screen contents with the `--freeze` flag)
 
-### Manual
-
-To install manually, simply clone this repo and copy/symlink the `hyprshot` script to a folder in your `PATH`:
-
+First create 
 ```bash
-$ git clone https://github.com/Gustash/hyprshot.git Hyprshot
-$ ln -s $(pwd)/Hyprshot/hyprshot $HOME/.local/bin
-$ chmod +x Hyprshot/hyprshot
+mkdir -p "$HOME/.local/bin"
+```
+
+curl
+```bash
+curl -o "$HOME/.local/bin/hyprclipshot" "https://raw.githubusercontent.com/mrbhanukab/HyprClipShot/refs/heads/main/hyprclipshot"
+chmod +x "$HOME/.local/bin/hyprclipshot"
+```
+
+wget
+```
+wget -O "$HOME/.local/bin/hyprclipshot" "https://raw.githubusercontent.com/mrbhanukab/HyprClipShot/refs/heads/main/hyprclipshot"
+chmod +x "$HOME/.local/bin/hyprclipshot"
 ```
 
 ## Usage
